@@ -1,0 +1,11 @@
+# Build artifacts
+*.o
+*.d
+*.a
+hotspot
+hotfloorplan
+
+# Generated output directories
+generated_3d_stack/
+outputs/
+*.init
