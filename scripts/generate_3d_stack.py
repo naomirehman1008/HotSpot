@@ -69,6 +69,8 @@ class StackConfig:
     # TSV geometry
     num_tsv_strips: int = 2       # number of horizontal TSV strip regions
     tsv_area_fraction: float = 0.05  # fraction of bonding layer area that is TSV
+    tsv_diameter: float = 10e-6      # 10 um TSV diameter
+    tsv_keepout_zone: float = 5e-6   # 5 um keep-out zone radius from TSV edge
 
     # -- Top TIM layer (between topmost tier and heat sink) -----------------
     tim_thickness: float = 20e-6      # 20 um
@@ -121,6 +123,107 @@ def effective_medium(k1: float, p1: float,
     k_eff = f1 * k1 + (1.0 - f1) * k2
     p_eff = f1 * p1 + (1.0 - f1) * p2
     return k_eff, p_eff
+
+
+# ---------------------------------------------------------------------------
+# Integration density
+# ---------------------------------------------------------------------------
+
+@dataclass
+class IntegrationDensity:
+    """Per-tier integration density metrics."""
+
+    tier: int
+    chip_area: float           # total chip area (m^2)
+    num_tsvs: int              # number of TSVs passing through this tier
+    tsv_footprint: float       # total TSV cross-section area (m^2)
+    keepout_area: float        # total keep-out zone area (m^2), excludes TSV itself
+    excluded_area: float       # tsv_footprint + keepout_area (m^2)
+    usable_area: float         # chip_area - excluded_area (m^2)
+    density_pct: float         # usable_area / chip_area * 100
+
+
+def compute_integration_density(cfg: StackConfig) -> list[IntegrationDensity]:
+    """Compute per-tier integration density.
+
+    TSVs pass through silicon tiers to connect to the tier above.  Each
+    TSV occupies a circular cross-section of diameter ``tsv_diameter`` and
+    imposes a keep-out zone of radius ``tsv_keepout_zone`` from the TSV
+    edge where active devices cannot be placed.
+
+    Tiers 0 .. N-2 each have TSVs; the top tier (N-1) has none.
+
+    Returns a list of :class:`IntegrationDensity`, one per tier.
+    """
+    chip_area = cfg.chip_width * cfg.chip_height
+    tsv_radius = cfg.tsv_diameter / 2.0
+    tsv_cross_section = math.pi * tsv_radius ** 2
+
+    if tsv_cross_section > 0:
+        num_tsvs = int(round(cfg.tsv_area_fraction * chip_area / tsv_cross_section))
+    else:
+        num_tsvs = 0
+
+    # Area excluded per TSV: circle of radius (tsv_radius + koz)
+    exclusion_radius = tsv_radius + cfg.tsv_keepout_zone
+    exclusion_per_tsv = math.pi * exclusion_radius ** 2
+
+    total_tsv_footprint = num_tsvs * tsv_cross_section
+    total_exclusion = num_tsvs * exclusion_per_tsv
+    total_keepout_only = total_exclusion - total_tsv_footprint
+
+    # Clamp to chip area (keep-out zones can overlap at high density)
+    total_exclusion = min(total_exclusion, chip_area)
+
+    results: list[IntegrationDensity] = []
+    for tier in range(cfg.num_layers):
+        if tier < cfg.num_layers - 1:
+            usable = chip_area - total_exclusion
+            results.append(IntegrationDensity(
+                tier=tier,
+                chip_area=chip_area,
+                num_tsvs=num_tsvs,
+                tsv_footprint=total_tsv_footprint,
+                keepout_area=total_keepout_only,
+                excluded_area=total_exclusion,
+                usable_area=usable,
+                density_pct=usable / chip_area * 100.0,
+            ))
+        else:
+            # Top tier: no TSVs pass through
+            results.append(IntegrationDensity(
+                tier=tier,
+                chip_area=chip_area,
+                num_tsvs=0,
+                tsv_footprint=0.0,
+                keepout_area=0.0,
+                excluded_area=0.0,
+                usable_area=chip_area,
+                density_pct=100.0,
+            ))
+
+    return results
+
+
+def print_integration_density(densities: list[IntegrationDensity]) -> None:
+    """Print integration density report to stdout."""
+    print("  Integration density (usable silicon area):")
+    for d in densities:
+        if d.num_tsvs > 0:
+            # Convert m^2 to mm^2 for readability (1 m^2 = 1e6 mm^2)
+            excl_mm2 = d.excluded_area * 1e6
+            tsv_mm2 = d.tsv_footprint * 1e6
+            koz_mm2 = d.keepout_area * 1e6
+            print(f"    Tier {d.tier}: {d.density_pct:6.2f}%  "
+                  f"({d.num_tsvs} TSVs, "
+                  f"excluded {excl_mm2:.4f} mm^2 = "
+                  f"TSV {tsv_mm2:.4f} + "
+                  f"KOZ {koz_mm2:.4f} mm^2)")
+        else:
+            print(f"    Tier {d.tier}: {d.density_pct:6.2f}%  (no TSVs)")
+    # Overall average
+    avg = sum(d.density_pct for d in densities) / len(densities)
+    print(f"    Average:  {avg:6.2f}%")
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +606,9 @@ def generate_3d_stack(cfg: StackConfig) -> None:
     print(f"    k_eff = {k_eff:.4f} W/(m-K)")
     print(f"    p_eff = {p_eff:.6e} J/(m^3-K)")
     print()
+    densities = compute_integration_density(cfg)
+    print_integration_density(densities)
+    print()
     print("  Files:")
     for f in sorted(os.listdir(cfg.output_dir)):
         print(f"    {f}")
@@ -538,6 +644,14 @@ def main() -> None:
         "--power-per-layer", type=float, default=10.0,
         help="Uniform power per silicon layer in Watts",
     )
+    parser.add_argument(
+        "--tsv-diameter", type=float, default=10e-6,
+        help="TSV diameter in meters (default: 10 um)",
+    )
+    parser.add_argument(
+        "--tsv-keepout-zone", type=float, default=5e-6,
+        help="Keep-out zone radius from TSV edge in meters (default: 5 um)",
+    )
 
     args = parser.parse_args()
 
@@ -550,6 +664,8 @@ def main() -> None:
         chip_width=args.chip_width,
         chip_height=args.chip_height,
         power_per_layer=args.power_per_layer,
+        tsv_diameter=args.tsv_diameter,
+        tsv_keepout_zone=args.tsv_keepout_zone,
     )
 
     generate_3d_stack(cfg)
