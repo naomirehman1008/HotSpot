@@ -7,25 +7,34 @@ thermal simulation of 3D stacked chips.
 
 Each tier in the stack consists of (bottom to top within the tier):
   1. Silicon die (active, power-dissipating)
-  2. Metal/dielectric interconnect layer (modeled via Effective Medium
-     Approximation / Rule of Mixtures)
+  2. Per-metal-level BEOL layers (M1-M9, each with its own EMA-computed
+     effective thermal conductivity based on pitch/width/fill at that level)
   3. TSV/bonding layer connecting to the next tier (heterogeneous blocks
      for detailed_3D mode)
 
 The topmost tier replaces the TSV/bonding layer with a TIM layer to the
 heat sink.
 
+BEOL layer parameters default to ASAP7 7nm PDK values (9 metal levels in
+4 groups: M1-M3 @36nm pitch, M4-M5 @48nm, M6-M7 @64nm, M8-M9 @80nm).
+Each metal level becomes a separate HotSpot thermal layer with individually
+computed effective thermal conductivity via the Rule of Mixtures.
+
 Usage:
     python generate_3d_stack.py -n 4                     # 4-tier stack
     python generate_3d_stack.py -n 2 -o my_stack         # custom output dir
     python generate_3d_stack.py -n 3 --power-per-layer 5 # 5W per tier
+    python generate_3d_stack.py -n 2 --beol-preset asap7 # explicit PDK preset
+
+TODO Joule Heating?
 """
 
 import argparse
+import json
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass
@@ -49,14 +58,64 @@ class StackConfig:
     silicon_conductivity: float = 130.0   # W/(m-K)
     silicon_specific_heat: float = 1.75e6 # J/(m^3-K)
 
-    # -- Metal / dielectric (BEOL) layer ------------------------------------
-    # Individual material properties used for EMA calculation.
-    metal_dielectric_thickness: float = 10e-6  # 10 um
-    metal_conductivity: float = 401.0          # copper, W/(m-K)
+    # -- BEOL metal/dielectric layers ----------------------------------------
+    # Each metal level is modeled as a separate thermal layer with its own
+    # EMA-computed effective conductivity.  The ``beol_layers`` list defines
+    # the stack from M1 (closest to silicon) upward.
+    #
+    # Geometry defaults from ASAP7 7nm PDK (9 metal levels, 4 pitch groups).
+    # Source: asap7_pdk_r1p7 config files (m1-m3.json, m4-m5.json, etc.)
+    #   - Fill fraction = width / pitch = 0.50 (at minimum pitch)
+    #   - Layer thickness = metal height = AR * width  (AR = 2 for ASAP7)
+    #
+    # Each entry: (name, pitch_nm, width_nm, height_nm, fill_fraction)
+    # The ILD thickness between metal levels equals the metal height.
+    beol_layers: list = field(default_factory=lambda: [
+        # ASAP7: M1-M3 group (36 nm pitch, EUV patterned)
+        ("M1", 36, 18, 36, 0.50),
+        ("M2", 36, 18, 36, 0.50),
+        ("M3", 36, 18, 36, 0.50),
+        # ASAP7: M4-M5 group (48 nm pitch, SADP patterned)
+        ("M4", 48, 24, 48, 0.50),
+        ("M5", 48, 24, 48, 0.50),
+        # ASAP7: M6-M7 group (64 nm pitch, SADP patterned)
+        ("M6", 64, 32, 64, 0.50),
+        ("M7", 64, 32, 64, 0.50),
+        # ASAP7: M8-M9 group (80 nm pitch, top-level routing)
+        ("M8", 80, 40, 80, 0.50),
+        ("M9", 80, 40, 80, 0.50),
+    ])
+    #
+    # THERMAL CONDUCTIVITY VALUES
+    # NOTE: The ASAP7 PDK does not provide thermal conductivity — only
+    # electrical parameters (rho, e_r).  The defaults below are *derived
+    # estimates*, not measured/PDK values.  Override with --metal-conductivity
+    # and --dielectric-conductivity if you have better numbers.
+    #
+    # TODO: Find published measurement data for Cu thermal conductivity at
+    #       nanoscale wire dimensions and for the specific low-k ILD
+    #       formulation assumed by ASAP7.  Candidates:
+    #       - Im et al., IEEE TED 2005 (k vs e_r correlation)
+    #       - Kuo et al., "Thermal conductivity of ultra low-k dielectrics"
+    #         Microelectronic Engineering 2003
+    #       - imec BTE-FEM studies (calibrated to self-heating measurements)
+    #
+    # Metal thermal conductivity [W/(m-K)].
+    # Derived via Wiedemann-Franz from ASAP7 effective rho = 5 uOhm-cm:
+    #   k_eff = k_bulk_Cu * (rho_bulk / rho_eff) = 401 * (1.7/5) ~ 136
+    # Bulk Cu = 401 W/(m-K) at rho = 1.7 uOhm-cm; at 7nm, grain-boundary
+    # and surface scattering raise rho to ~5 uOhm-cm (per ASAP7 PDK).
+    metal_conductivity: float = 136.0          # ESTIMATE, W/(m-K)
     metal_specific_heat: float = 3.42e6        # copper, J/(m^3-K)
-    dielectric_conductivity: float = 1.4       # SiO2, W/(m-K)
-    dielectric_specific_heat: float = 1.65e6   # SiO2, J/(m^3-K)
-    metal_fill_fraction: float = 0.30          # volume fraction of metal
+    # Low-k dielectric thermal conductivity [W/(m-K)].
+    # ASAP7 specifies e_r = 2.7 (SiCOH / organosilicate glass).
+    # Thermal conductivity is NOT in the PDK.  This estimate is from the
+    # literature correlation between e_r and k for SiCOH materials:
+    #   e_r ~ 2.7 => k ~ 0.20-0.30 W/(m-K)  (midpoint used)
+    # For reference, SiO2 (e_r ~ 4.0) has k ~ 1.4 W/(m-K) — the low-k
+    # materials trade thermal conductivity for lower capacitance.
+    dielectric_conductivity: float = 0.25      # ESTIMATE, W/(m-K)
+    dielectric_specific_heat: float = 1.65e6   # J/(m^3-K)
 
     # -- TSV / bonding layer ------------------------------------------------
     tsv_bonding_thickness: float = 20e-6  # 20 um
@@ -281,13 +340,12 @@ def generate_silicon_flp(cfg: StackConfig, tier: int, path: str) -> list[str]:
     return [name]
 
 
-def generate_metal_dielectric_flp(cfg: StackConfig, tier: int,
-                                  path: str) -> list[str]:
-    """Single monolithic block; layer-level EMA properties are set in the LCF."""
-    name = f"metal_dielectric_{tier}"
+def generate_beol_layer_flp(cfg: StackConfig, tier: int,
+                            metal_name: str, path: str) -> list[str]:
+    """Single monolithic block for one BEOL metal level; EMA properties in LCF."""
+    name = f"beol_{metal_name}_{tier}"
     with open(path, "w") as fh:
-        fh.write(f"# Metal/dielectric (BEOL) – tier {tier}\n")
-        fh.write(f"# Effective medium: metal fill fraction = {cfg.metal_fill_fraction}\n")
+        fh.write(f"# BEOL {metal_name} – tier {tier}\n")
         fh.write(_flp_line(name, cfg.chip_width, cfg.chip_height, 0.0, 0.0))
     return [name]
 
@@ -379,6 +437,24 @@ def _lcf_layer(fh, layer_num: int, lateral: str, power: str,
     fh.write(f"{flp_file}\n\n")
 
 
+def compute_beol_ema(cfg: StackConfig) -> list[tuple[str, float, float, float, float]]:
+    """Compute per-metal-level EMA thermal properties.
+
+    Returns a list of (name, thickness_m, k_eff, p_eff, fill) for each
+    BEOL metal level defined in ``cfg.beol_layers``.
+    """
+    results = []
+    for (name, _pitch_nm, _width_nm, height_nm, fill) in cfg.beol_layers:
+        thickness = height_nm * 1e-9  # nm -> m
+        k_eff, p_eff = effective_medium(
+            cfg.metal_conductivity, cfg.metal_specific_heat,
+            cfg.dielectric_conductivity, cfg.dielectric_specific_heat,
+            fill,
+        )
+        results.append((name, thickness, k_eff, p_eff, fill))
+    return results
+
+
 def generate_lcf(cfg: StackConfig, flp_files: list[str],
                  path: str) -> None:
     """Generate the layer configuration file.
@@ -387,21 +463,21 @@ def generate_lcf(cfg: StackConfig, flp_files: list[str],
 
         For each tier 0 .. N-1:
             silicon  (Power = Y)
-            metal/dielectric  (Power = N, EMA properties)
+            M1 BEOL layer  (Power = N, per-level EMA)
+            M2 BEOL layer  (Power = N, per-level EMA)
+            ...
+            M9 BEOL layer  (Power = N, per-level EMA)
             tsv/bonding  (Power = N, heterogeneous)   [omitted for top tier]
         Top tier ends with:
             TIM  (Power = N)
     """
-    k_eff, p_eff = effective_medium(
-        cfg.metal_conductivity, cfg.metal_specific_heat,
-        cfg.dielectric_conductivity, cfg.dielectric_specific_heat,
-        cfg.metal_fill_fraction,
-    )
-    r_eff = 1.0 / k_eff
+    beol_ema = compute_beol_ema(cfg)
 
     with open(path, "w") as fh:
         fh.write("# Layer Configuration File – 3D Stacked Chip\n")
         fh.write("# Generated by generate_3d_stack.py\n")
+        fh.write(f"# BEOL: {len(cfg.beol_layers)} metal levels per tier "
+                 f"(ASAP7 7nm defaults)\n")
         fh.write("#\n")
         fh.write("# <Layer Number>\n")
         fh.write("# <Lateral heat flow Y/N?>\n")
@@ -425,16 +501,18 @@ def generate_lcf(cfg: StackConfig, flp_files: list[str],
             layer_num += 1
             flp_idx += 1
 
-            # --- metal / dielectric (EMA) ---
-            _lcf_layer(fh, layer_num, "Y", "N",
-                       p_eff, r_eff,
-                       cfg.metal_dielectric_thickness,
-                       flp_files[flp_idx],
-                       comment=(f"Tier {tier}: Metal/dielectric "
-                                f"(EMA k_eff={k_eff:.2f} W/(m-K), "
-                                f"fill={cfg.metal_fill_fraction})"))
-            layer_num += 1
-            flp_idx += 1
+            # --- per-metal-level BEOL layers ---
+            for (mname, thickness, k_eff, p_eff, fill_frac) in beol_ema:
+                _lcf_layer(fh, layer_num, "Y", "N",
+                           p_eff, 1.0 / k_eff,
+                           thickness,
+                           flp_files[flp_idx],
+                           comment=(f"Tier {tier}: {mname} "
+                                    f"(EMA k_eff={k_eff:.2f} W/(m-K), "
+                                    f"fill={fill_frac:.2f}, "
+                                    f"t={thickness*1e9:.0f} nm)"))
+                layer_num += 1
+                flp_idx += 1
 
             if tier < cfg.num_layers - 1:
                 # --- TSV / bonding ---
@@ -578,6 +656,9 @@ def generate_3d_stack(cfg: StackConfig) -> None:
     validate_tsv_config(cfg)
     os.makedirs(cfg.output_dir, exist_ok=True)
 
+    beol_ema = compute_beol_ema(cfg)
+    num_beol = len(cfg.beol_layers)
+
     flp_files: list[str] = []       # filenames in layer order (for LCF)
     silicon_names: list[str] = []   # block names of power-dissipating layers
 
@@ -589,11 +670,12 @@ def generate_3d_stack(cfg: StackConfig) -> None:
         flp_files.append(fname)
         silicon_names.extend(names)
 
-        # --- metal / dielectric ---
-        fname = f"metal_dielectric_{tier}.flp"
-        generate_metal_dielectric_flp(
-            cfg, tier, os.path.join(cfg.output_dir, fname))
-        flp_files.append(fname)
+        # --- per-metal-level BEOL layers ---
+        for (mname, _thickness, _k_eff, _p_eff, _fill) in beol_ema:
+            fname = f"beol_{mname}_{tier}.flp"
+            generate_beol_layer_flp(
+                cfg, tier, mname, os.path.join(cfg.output_dir, fname))
+            flp_files.append(fname)
 
         # --- TSV / bonding  OR  top TIM ---
         if tier < cfg.num_layers - 1:
@@ -624,23 +706,38 @@ def generate_3d_stack(cfg: StackConfig) -> None:
                         os.path.join(cfg.output_dir, "run.sh"))
 
     # --- summary ---
-    k_eff, p_eff = effective_medium(
-        cfg.metal_conductivity, cfg.metal_specific_heat,
-        cfg.dielectric_conductivity, cfg.dielectric_specific_heat,
-        cfg.metal_fill_fraction,
-    )
+    # layers per tier: 1 silicon + N beol + 1 (tsv or tim)
+    layers_per_tier = 1 + num_beol + 1
+    total_lcf_layers = cfg.num_layers * layers_per_tier
+    total_beol_thickness = sum(t for (_, t, _, _, _) in beol_ema)
 
-    total_lcf_layers = cfg.num_layers * 3  # silicon + MD + (TSV or TIM)
     print(f"Generated {cfg.num_layers}-tier 3D stack in '{cfg.output_dir}/'")
     print(f"  LCF layers:           {total_lcf_layers}")
     print(f"  Silicon layers:       {cfg.num_layers}  (power-dissipating)")
-    print(f"  Metal/dielectric:     {cfg.num_layers}  (EMA)")
+    print(f"  BEOL layers/tier:     {num_beol}  ({num_beol * cfg.num_layers} total)")
     print(f"  TSV/bonding layers:   {cfg.num_layers - 1}")
     print(f"  TIM top layer:        1")
     print()
-    print(f"  Metal/dielectric EMA (fill = {cfg.metal_fill_fraction}):")
-    print(f"    k_eff = {k_eff:.4f} W/(m-K)")
-    print(f"    p_eff = {p_eff:.6e} J/(m^3-K)")
+    print(f"  BEOL stack ({num_beol} metal levels, "
+          f"total thickness = {total_beol_thickness*1e9:.0f} nm "
+          f"= {total_beol_thickness*1e6:.3f} um):")
+    print(f"    {'Level':<6} {'Pitch':>7} {'Width':>7} {'Height':>8} "
+          f"{'Fill':>6} {'k_eff':>10} {'r_eff':>12}")
+    print(f"    {'':─<6} {'(nm)':─>7} {'(nm)':─>7} {'(nm)':─>8} "
+          f"{'':─>6} {'W/(m-K)':─>10} {'(m-K)/W':─>12}")
+    for (mname, pitch, width, height, fill) in cfg.beol_layers:
+        k_eff, _ = effective_medium(
+            cfg.metal_conductivity, cfg.metal_specific_heat,
+            cfg.dielectric_conductivity, cfg.dielectric_specific_heat,
+            fill,
+        )
+        print(f"    {mname:<6} {pitch:>7} {width:>7} {height:>8} "
+              f"{fill:>6.2f} {k_eff:>10.2f} {1.0/k_eff:>12.6f}")
+    print(f"    Metal k = {cfg.metal_conductivity:.1f} W/(m-K) "
+          f"(ESTIMATE: Wiedemann-Franz from ASAP7 rho=5 uOhm-cm)")
+    print(f"    Dielectric k = {cfg.dielectric_conductivity:.2f} W/(m-K) "
+          f"(ESTIMATE: literature correlation for e_r~2.7 SiCOH)")
+
     n_side = int(round(math.isqrt(cfg.tsv_density)))
     pitch_um = (cfg.chip_width / n_side) * 1e6 if n_side > 0 else 0.0
     print()
@@ -699,6 +796,24 @@ def main() -> None:
         "--tsv-keepout-zone", type=float, default=5e-6,
         help="Keep-out zone radius from TSV edge in meters (default: 5 um)",
     )
+    parser.add_argument(
+        "--beol-config", type=str, default=None,
+        help=("Path to a JSON file defining BEOL metal layers. "
+              "Format: list of [name, pitch_nm, width_nm, height_nm, fill]. "
+              "Overrides the built-in ASAP7 defaults."),
+    )
+    parser.add_argument(
+        "--metal-conductivity", type=float, default=136.0,
+        help=("Metal thermal conductivity in W/(m-K). "
+              "Default 136 is an ESTIMATE derived via Wiedemann-Franz "
+              "from ASAP7 rho=5 uOhm-cm — not a PDK/measured value."),
+    )
+    parser.add_argument(
+        "--dielectric-conductivity", type=float, default=0.25,
+        help=("ILD thermal conductivity in W/(m-K). "
+              "Default 0.25 is an ESTIMATE from literature correlation "
+              "for e_r~2.7 SiCOH — not a PDK/measured value."),
+    )
 
     args = parser.parse_args()
 
@@ -714,7 +829,19 @@ def main() -> None:
         tsv_density=args.tsv_density,
         tsv_diameter=args.tsv_diameter,
         tsv_keepout_zone=args.tsv_keepout_zone,
+        metal_conductivity=args.metal_conductivity,
+        dielectric_conductivity=args.dielectric_conductivity,
     )
+
+    # Load custom BEOL config if provided
+    if args.beol_config:
+        with open(args.beol_config, "r") as f:
+            beol_data = json.load(f)
+        cfg.beol_layers = [
+            (str(entry[0]), int(entry[1]), int(entry[2]),
+             int(entry[3]), float(entry[4]))
+            for entry in beol_data
+        ]
 
     generate_3d_stack(cfg)
 
