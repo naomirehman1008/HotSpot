@@ -13,7 +13,9 @@ Each tier in the stack consists of (bottom to top within the tier):
      for detailed_3D mode)
 
 The topmost tier replaces the TSV/bonding layer with a TIM layer to the
-heat sink.
+heat sink. 
+NAOMI FIXME: this should be a BGA or something to the substrate.
+The heat sink goes on the silicon side I think.
 
 BEOL layer parameters default to ASAP7 7nm PDK values (9 metal levels in
 4 groups: M1-M3 @36nm pitch, M4-M5 @48nm, M6-M7 @64nm, M8-M9 @80nm).
@@ -26,7 +28,9 @@ Usage:
     python generate_3d_stack.py -n 3 --power-per-layer 5 # 5W per tier
     python generate_3d_stack.py -n 2 --beol-preset asap7 # explicit PDK preset
 
-TODO Joule Heating?
+TODO:
+- Joule Heating?
+- Thermal coupling layer? (https://www.imec-int.com/en/articles/mitigating-thermal-bottleneck-advanced-interconnects)
 """
 
 import argparse
@@ -130,19 +134,19 @@ class StackConfig:
     tsv_density: int = 900        # TSVs per chip (must be a perfect square)
     tsv_diameter: float = 10e-6   # 10 um TSV diameter
     tsv_keepout_zone: float = 5e-6  # 5 um keep-out zone radius from TSV edge
-
+ 
     # -- Top TIM layer (between topmost tier and heat sink) -----------------
     tim_thickness: float = 20e-6      # 20 um
     tim_conductivity: float = 4.0     # W/(m-K)
     tim_specific_heat: float = 4.0e6  # J/(m^3-K)
 
     # -- Power --------------------------------------------------------------
-    power_per_layer: float = 10.0  # watts per silicon layer (uniform)
+    power_per_layer: float = 10.0  # watts per silicon layer (uniform) NAOMI FIXME: should be W/mm^2
     num_power_samples: int = 1     # number of time-step rows in ptrace
 
     # -- Grid model ---------------------------------------------------------
-    grid_rows: int = 64
-    grid_cols: int = 64
+    grid_rows: int = 16
+    grid_cols: int = 16
 
     # -- Simulation ---------------------------------------------------------
     ambient_temp: float = 318.15       # kelvin (45 C)
@@ -525,6 +529,7 @@ def generate_lcf(cfg: StackConfig, flp_files: list[str],
                 layer_num += 1
                 flp_idx += 1
             else:
+                # FIXME: this should go on the silicon side!!
                 # --- top TIM ---
                 _lcf_layer(fh, layer_num, "Y", "N",
                            cfg.tim_specific_heat,
@@ -814,6 +819,10 @@ def main() -> None:
               "Default 0.25 is an ESTIMATE from literature correlation "
               "for e_r~2.7 SiCOH — not a PDK/measured value."),
     )
+    parser.add_argument(
+        "--grid-size", type=int, default=None,
+        help="Grid resolution (sets both grid_rows and grid_cols to N)",
+    )
 
     args = parser.parse_args()
 
@@ -832,6 +841,10 @@ def main() -> None:
         metal_conductivity=args.metal_conductivity,
         dielectric_conductivity=args.dielectric_conductivity,
     )
+
+    if args.grid_size is not None:
+        cfg.grid_rows = args.grid_size
+        cfg.grid_cols = args.grid_size
 
     # Load custom BEOL config if provided
     if args.beol_config:
