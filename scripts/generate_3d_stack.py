@@ -29,7 +29,6 @@ Usage:
     python generate_3d_stack.py -n 2 --beol-preset asap7 # explicit PDK preset
 
 TODO:
-- Joule Heating?
 - Thermal coupling layer? (https://www.imec-int.com/en/articles/mitigating-thermal-bottleneck-advanced-interconnects)
 """
 
@@ -130,7 +129,6 @@ class StackConfig:
     bonding_conductivity: float = 0.2     # W/(m-K)
     bonding_specific_heat: float = 2.0e6  # J/(m^3-K)
     # TSV geometry
-    num_tsv_strips: int = 2       # number of horizontal TSV strip regions
     tsv_density: int = 900        # TSVs per chip (must be a perfect square)
     tsv_diameter: float = 10e-6   # 10 um TSV diameter
     tsv_keepout_zone: float = 5e-6  # 5 um keep-out zone radius from TSV edge
@@ -143,6 +141,14 @@ class StackConfig:
     # -- Power --------------------------------------------------------------
     power_per_layer: float = 10.0  # watts per silicon layer (uniform) NAOMI FIXME: should be W/mm^2
     num_power_samples: int = 1     # number of time-step rows in ptrace
+
+    # -- BEOL Joule heating ---------------------------------------------------
+    # Mode A (uniform): total BEOL Joule heating per tier in watts, split
+    #   equally across all metal levels.  Default 0 = Joule heating disabled.
+    # Mode B (per-level): dict mapping metal level name -> power in watts.
+    #   Overrides Mode A when set.  Loaded from --beol-power-config JSON.
+    beol_power_per_tier: float = 0.0
+    beol_power_map: dict | None = None
 
     # -- Grid model ---------------------------------------------------------
     grid_rows: int = 16
@@ -354,62 +360,80 @@ def generate_beol_layer_flp(cfg: StackConfig, tier: int,
     return [name]
 
 
-def generate_tsv_bonding_flp(cfg: StackConfig, tier: int,
-                             path: str) -> list[str]:
-    """Heterogeneous floorplan with alternating dielectric and TSV strips.
+def compute_tsv_ema(cfg: StackConfig) -> tuple[float, float]:
+    """Compute EMA thermal properties for the TSV/bonding layer.
 
-    TSV strips carry per-block R-C overrides for ``detailed_3D`` mode.
-    The bulk layer properties (set in the LCF) correspond to the bonding
-    dielectric; TSV strips override with copper-like values.
+    The TSV/bonding layer is treated as a homogeneous composite of copper TSVs
+    embedded in a bonding dielectric.  The effective thermal conductivity is
+    computed via the Rule of Mixtures (parallel conductances, valid when the
+    two phases are arranged in parallel with respect to the heat flow direction,
+    i.e. vertical/z conduction through the layer):
+
+        k_eff = f_tsv * k_tsv + (1 - f_tsv) * k_bonding
+
+    where the TSV area fraction is:
+
+        f_tsv = N_tsv * pi * r_tsv^2 / A_chip
+
+    The volumetric heat capacity is likewise area-weighted:
+
+        p_eff = f_tsv * p_tsv + (1 - f_tsv) * p_bonding
+
+    Equation source: Rule of Mixtures (parallel conductance model),
+    e.g. Incropera & DeWitt, *Fundamentals of Heat and Mass Transfer*, §3.3.
+
+    This replaces the previous heterogeneous strip floorplan approach, which
+    produced a ~13 K grid-alignment artifact because the TSV strip height
+    (~3.5 µm at default settings) was far smaller than any practical grid cell,
+    causing the strip to be sampled differently depending on whether its boundary
+    fell inside one cell or straddled a cell boundary.  See findings.md for the
+    full analysis.
+
+    Returns
+    -------
+    (k_eff, p_eff) in W/(m-K) and J/(m^3-K).
     """
-    names: list[str] = []
-
     chip_area = cfg.chip_width * cfg.chip_height
     tsv_radius = cfg.tsv_diameter / 2.0
-    tsv_area_fraction = cfg.tsv_density * math.pi * tsv_radius ** 2 / chip_area
+    f_tsv = cfg.tsv_density * math.pi * tsv_radius ** 2 / chip_area
 
-    total_tsv_height = tsv_area_fraction * cfg.chip_height
-    tsv_strip_height = total_tsv_height / cfg.num_tsv_strips
+    k_eff = f_tsv * cfg.tsv_conductivity + (1.0 - f_tsv) * cfg.bonding_conductivity
+    p_eff = f_tsv * cfg.tsv_specific_heat + (1.0 - f_tsv) * cfg.bonding_specific_heat
 
-    total_dielectric_height = cfg.chip_height - total_tsv_height
-    num_dielectric_blocks = cfg.num_tsv_strips + 1
-    dielectric_block_height = total_dielectric_height / num_dielectric_blocks
+    return k_eff, p_eff
 
-    tsv_resistivity = 1.0 / cfg.tsv_conductivity
 
+def generate_tsv_bonding_flp(cfg: StackConfig, tier: int,
+                             path: str) -> list[str]:
+    """Single-block homogenized floorplan for the TSV/bonding layer.
+
+    The 900 TSVs are too small (f_tsv ~ 0.07% area, strip height ~ 3.5 µm) to
+    resolve with any practical HotSpot grid size.  The previous heterogeneous
+    strip representation caused a ~13 K grid-alignment artifact (see
+    findings.md).  The layer is now modeled as a single homogeneous block whose
+    effective thermal conductivity is computed by compute_tsv_ema().
+    """
+    chip_area = cfg.chip_width * cfg.chip_height
+    tsv_radius = cfg.tsv_diameter / 2.0
+    f_tsv = cfg.tsv_density * math.pi * tsv_radius ** 2 / chip_area
+
+    k_eff, p_eff = compute_tsv_ema(cfg)
+    resistivity = 1.0 / k_eff
+
+    name = f"tsv_bonding_{tier}"
     with open(path, "w") as fh:
         fh.write(f"# TSV/bonding layer – tier {tier}\n")
-        fh.write(f"# Heterogeneous: dielectric blocks + TSV strips (detailed_3D)\n")
-        fh.write(f"# TSV density = {cfg.tsv_density} ({int(round(math.isqrt(cfg.tsv_density)))}x{int(round(math.isqrt(cfg.tsv_density)))} grid), area fraction = {tsv_area_fraction:.6f}\n")
+        fh.write(f"# Homogenized EMA: f_tsv={f_tsv:.6f}, "
+                 f"k_eff={k_eff:.4f} W/(m-K), p_eff={p_eff:.4e} J/(m^3-K)\n")
+        fh.write(f"# k_tsv={cfg.tsv_conductivity} W/(m-K) (bulk Cu), "
+                 f"k_bonding={cfg.bonding_conductivity} W/(m-K)\n")
+        fh.write(f"# TSV density = {cfg.tsv_density} "
+                 f"({int(round(math.isqrt(cfg.tsv_density)))}x"
+                 f"{int(round(math.isqrt(cfg.tsv_density)))} grid)\n")
+        fh.write(_flp_line(name, cfg.chip_width, cfg.chip_height, 0.0, 0.0,
+                           specific_heat=p_eff, resistivity=resistivity))
 
-        y = 0.0
-        dielectric_idx = 0
-
-        for strip in range(cfg.num_tsv_strips):
-            # --- dielectric block ---
-            name = f"bond_d_{tier}_{dielectric_idx}"
-            fh.write(_flp_line(name, cfg.chip_width, dielectric_block_height,
-                               0.0, y))
-            names.append(name)
-            y += dielectric_block_height
-            dielectric_idx += 1
-
-            # --- TSV strip (custom R-C) ---
-            name = f"tsv_{tier}_{strip}"
-            fh.write(_flp_line(name, cfg.chip_width, tsv_strip_height,
-                               0.0, y,
-                               specific_heat=cfg.tsv_specific_heat,
-                               resistivity=tsv_resistivity))
-            names.append(name)
-            y += tsv_strip_height
-
-        # --- final dielectric block (absorbs any FP rounding) ---
-        remaining = cfg.chip_height - y
-        name = f"bond_d_{tier}_{dielectric_idx}"
-        fh.write(_flp_line(name, cfg.chip_width, remaining, 0.0, y))
-        names.append(name)
-
-    return names
+    return [name]
 
 
 def generate_tim_top_flp(cfg: StackConfig, path: str) -> list[str]:
@@ -459,22 +483,56 @@ def compute_beol_ema(cfg: StackConfig) -> list[tuple[str, float, float, float, f
     return results
 
 
+def get_beol_power_per_level(cfg: StackConfig) -> dict[str, float]:
+    """Return per-metal-level Joule heating power in watts.
+
+    Mode B (per-level): if ``cfg.beol_power_map`` is set, use it directly.
+      Keys must match the names in ``cfg.beol_layers``; missing keys default
+      to 0.0 watts.
+    Mode A (uniform): if ``cfg.beol_power_per_tier > 0``, distribute evenly
+      across all metal levels: power = beol_power_per_tier / N.
+    Default: all zeros (Joule heating disabled).
+    """
+    names = [name for (name, *_) in cfg.beol_layers]
+    if cfg.beol_power_map is not None:
+        # Validate keys
+        unknown = set(cfg.beol_power_map.keys()) - set(names)
+        if unknown:
+            sys.exit(f"Error: --beol-power-config contains unknown metal "
+                     f"level names: {sorted(unknown)}. "
+                     f"Valid names: {names}")
+        return {name: float(cfg.beol_power_map.get(name, 0.0)) for name in names}
+    elif cfg.beol_power_per_tier > 0.0:
+        per_level = cfg.beol_power_per_tier / len(names)
+        return {name: per_level for name in names}
+    else:
+        return {name: 0.0 for name in names}
+
+
 def generate_lcf(cfg: StackConfig, flp_files: list[str],
-                 path: str) -> None:
+                 path: str, beol_power: dict[str, float] | None = None) -> None:
     """Generate the layer configuration file.
 
     Layer ordering (bottom to top)::
 
         For each tier 0 .. N-1:
             silicon  (Power = Y)
-            M1 BEOL layer  (Power = N, per-level EMA)
-            M2 BEOL layer  (Power = N, per-level EMA)
+            M1 BEOL layer  (Power = Y if Joule heating enabled, else N)
+            M2 BEOL layer  (Power = Y if Joule heating enabled, else N)
             ...
-            M9 BEOL layer  (Power = N, per-level EMA)
+            M9 BEOL layer  (Power = Y if Joule heating enabled, else N)
             tsv/bonding  (Power = N, heterogeneous)   [omitted for top tier]
         Top tier ends with:
             TIM  (Power = N)
+
+    Parameters
+    ----------
+    beol_power : dict mapping metal level name -> power in watts, or None.
+        When provided, BEOL layers with power > 0 get ``Power = Y`` in
+        the LCF.  Computed by :func:`get_beol_power_per_level`.
     """
+    if beol_power is None:
+        beol_power = {name: 0.0 for (name, *_) in cfg.beol_layers}
     beol_ema = compute_beol_ema(cfg)
 
     with open(path, "w") as fh:
@@ -507,7 +565,8 @@ def generate_lcf(cfg: StackConfig, flp_files: list[str],
 
             # --- per-metal-level BEOL layers ---
             for (mname, thickness, k_eff, p_eff, fill_frac) in beol_ema:
-                _lcf_layer(fh, layer_num, "Y", "N",
+                beol_pwr_flag = "Y" if beol_power.get(mname, 0.0) > 0.0 else "N"
+                _lcf_layer(fh, layer_num, "Y", beol_pwr_flag,
                            p_eff, 1.0 / k_eff,
                            thickness,
                            flp_files[flp_idx],
@@ -519,13 +578,15 @@ def generate_lcf(cfg: StackConfig, flp_files: list[str],
                 flp_idx += 1
 
             if tier < cfg.num_layers - 1:
-                # --- TSV / bonding ---
+                # --- TSV / bonding (EMA homogenized) ---
+                tsv_k_eff, tsv_p_eff = compute_tsv_ema(cfg)
                 _lcf_layer(fh, layer_num, "Y", "N",
-                           cfg.bonding_specific_heat,
-                           1.0 / cfg.bonding_conductivity,
+                           tsv_p_eff,
+                           1.0 / tsv_k_eff,
                            cfg.tsv_bonding_thickness,
                            flp_files[flp_idx],
-                           comment=f"Tier {tier}: TSV/bonding (heterogeneous)")
+                           comment=(f"Tier {tier}: TSV/bonding "
+                                    f"(EMA k_eff={tsv_k_eff:.4f} W/(m-K))"))
                 layer_num += 1
                 flp_idx += 1
             else:
@@ -546,17 +607,32 @@ def generate_lcf(cfg: StackConfig, flp_files: list[str],
 # ---------------------------------------------------------------------------
 
 def generate_ptrace(cfg: StackConfig, silicon_names: list[str],
-                    path: str) -> None:
+                    path: str,
+                    beol_entries: list[tuple[str, float]] | None = None) -> None:
     """Generate a power trace with uniform power on each silicon layer.
 
-    Only blocks from power-dissipating layers (silicon) appear in the
-    ptrace.  Each silicon layer is a single block, so it receives the
-    full ``power_per_layer`` value.
+    Blocks from power-dissipating layers appear in the ptrace:
+    - Silicon blocks (always): each receives ``power_per_layer`` watts.
+    - BEOL blocks (optional): included when Joule heating is enabled;
+      each receives the per-level power from ``beol_entries``.
+
+    Parameters
+    ----------
+    silicon_names : list of silicon block names (one per tier).
+    beol_entries : list of (block_name, power_watts) for BEOL blocks
+        that have Power = Y.  Omit or pass None to disable.
     """
+    if beol_entries is None:
+        beol_entries = []
+
+    all_names = silicon_names + [name for (name, _) in beol_entries]
+    silicon_powers = [cfg.power_per_layer] * len(silicon_names)
+    beol_powers = [pwr for (_, pwr) in beol_entries]
+    all_powers = silicon_powers + beol_powers
+
     with open(path, "w") as fh:
-        fh.write("\t".join(silicon_names) + "\n")
-        power_values = [f"{cfg.power_per_layer}" for _ in silicon_names]
-        row = "\t".join(power_values)
+        fh.write("\t".join(all_names) + "\n")
+        row = "\t".join(str(p) for p in all_powers)
         for _ in range(cfg.num_power_samples):
             fh.write(row + "\n")
 
@@ -664,8 +740,13 @@ def generate_3d_stack(cfg: StackConfig) -> None:
     beol_ema = compute_beol_ema(cfg)
     num_beol = len(cfg.beol_layers)
 
+    # Compute per-level BEOL Joule heating power (all zeros if disabled)
+    beol_power = get_beol_power_per_level(cfg)
+
     flp_files: list[str] = []       # filenames in layer order (for LCF)
     silicon_names: list[str] = []   # block names of power-dissipating layers
+    # BEOL blocks with Joule heating: list of (block_name, power_watts)
+    beol_power_entries: list[tuple[str, float]] = []
 
     for tier in range(cfg.num_layers):
         # --- silicon ---
@@ -678,9 +759,13 @@ def generate_3d_stack(cfg: StackConfig) -> None:
         # --- per-metal-level BEOL layers ---
         for (mname, _thickness, _k_eff, _p_eff, _fill) in beol_ema:
             fname = f"beol_{mname}_{tier}.flp"
-            generate_beol_layer_flp(
+            block_names = generate_beol_layer_flp(
                 cfg, tier, mname, os.path.join(cfg.output_dir, fname))
             flp_files.append(fname)
+            pwr = beol_power.get(mname, 0.0)
+            if pwr > 0.0:
+                for bname in block_names:
+                    beol_power_entries.append((bname, pwr))
 
         # --- TSV / bonding  OR  top TIM ---
         if tier < cfg.num_layers - 1:
@@ -694,12 +779,14 @@ def generate_3d_stack(cfg: StackConfig) -> None:
 
     # --- LCF ---
     lcf_file = "stack.lcf"
-    generate_lcf(cfg, flp_files, os.path.join(cfg.output_dir, lcf_file))
+    generate_lcf(cfg, flp_files, os.path.join(cfg.output_dir, lcf_file),
+                 beol_power=beol_power)
 
     # --- power trace ---
     ptrace_file = "power.ptrace"
     generate_ptrace(cfg, silicon_names,
-                    os.path.join(cfg.output_dir, ptrace_file))
+                    os.path.join(cfg.output_dir, ptrace_file),
+                    beol_entries=beol_power_entries if beol_power_entries else None)
 
     # --- HotSpot config ---
     config_file = "hotspot.config"
@@ -743,13 +830,40 @@ def generate_3d_stack(cfg: StackConfig) -> None:
     print(f"    Dielectric k = {cfg.dielectric_conductivity:.2f} W/(m-K) "
           f"(ESTIMATE: literature correlation for e_r~2.7 SiCOH)")
 
+    # --- Joule heating summary ---
+    beol_power = get_beol_power_per_level(cfg)
+    total_joule = sum(beol_power.values())
+    if total_joule > 0.0:
+        if cfg.beol_power_map is not None:
+            mode_str = "Mode B (per-level, from --beol-power-config)"
+        else:
+            mode_str = "Mode A (uniform, from --beol-power)"
+        print()
+        print(f"  BEOL Joule heating: {mode_str}")
+        print(f"    {'Level':<6}  {'Power (W)':>10}")
+        print(f"    {'':─<6}  {'':─>10}")
+        for mname, pwr in beol_power.items():
+            print(f"    {mname:<6}  {pwr:>10.4f}")
+        print(f"    {'Total':<6}  {total_joule:>10.4f}  W/tier")
+    else:
+        print()
+        print("  BEOL Joule heating: disabled (use --beol-power or "
+              "--beol-power-config to enable)")
+
     n_side = int(round(math.isqrt(cfg.tsv_density)))
     pitch_um = (cfg.chip_width / n_side) * 1e6 if n_side > 0 else 0.0
+    chip_area = cfg.chip_width * cfg.chip_height
+    f_tsv = cfg.tsv_density * math.pi * (cfg.tsv_diameter / 2.0) ** 2 / chip_area
+    tsv_k_eff, tsv_p_eff = compute_tsv_ema(cfg)
     print()
-    print(f"  TSV geometry (diameter = {cfg.tsv_diameter * 1e6:.1f} um, "
-          f"KOZ = {cfg.tsv_keepout_zone * 1e6:.1f} um):")
-    print(f"    Grid:  {n_side}x{n_side} = {cfg.tsv_density} TSVs  "
-          f"(pitch = {pitch_um:.1f} um)")
+    print(f"  TSV/bonding layer (EMA homogenized, t = {cfg.tsv_bonding_thickness*1e6:.0f} um):")
+    print(f"    Grid:      {n_side}x{n_side} = {cfg.tsv_density} TSVs  "
+          f"(pitch = {pitch_um:.1f} um, diameter = {cfg.tsv_diameter*1e6:.1f} um)")
+    print(f"    f_tsv:     {f_tsv:.6f}  ({f_tsv*100:.4f}% area)")
+    print(f"    k_tsv:     {cfg.tsv_conductivity:.1f} W/(m-K)  (bulk Cu)")
+    print(f"    k_bonding: {cfg.bonding_conductivity:.3f} W/(m-K)")
+    print(f"    k_eff:     {tsv_k_eff:.4f} W/(m-K)  "
+          f"[Rule of Mixtures: f*k_tsv + (1-f)*k_bonding]")
     print()
     densities = compute_integration_density(cfg)
     print_integration_density(densities)
@@ -823,6 +937,19 @@ def main() -> None:
         "--grid-size", type=int, default=None,
         help="Grid resolution (sets both grid_rows and grid_cols to N)",
     )
+    parser.add_argument(
+        "--beol-power", type=float, default=0.0,
+        help=("Total BEOL Joule heating per tier in watts (Mode A). "
+              "Distributed equally across all metal levels. "
+              "Default 0 = disabled."),
+    )
+    parser.add_argument(
+        "--beol-power-config", type=str, default=None,
+        help=("Path to a JSON file mapping metal level names to per-level "
+              "power in watts (Mode B). "
+              "Example: {\"M1\": 0.1, \"M9\": 0.5}. "
+              "Overrides --beol-power."),
+    )
 
     args = parser.parse_args()
 
@@ -840,13 +967,19 @@ def main() -> None:
         tsv_keepout_zone=args.tsv_keepout_zone,
         metal_conductivity=args.metal_conductivity,
         dielectric_conductivity=args.dielectric_conductivity,
+        beol_power_per_tier=args.beol_power,
     )
 
     if args.grid_size is not None:
         cfg.grid_rows = args.grid_size
         cfg.grid_cols = args.grid_size
 
-    # Load custom BEOL config if provided
+    # Load per-level BEOL power config if provided (Mode B; overrides --beol-power)
+    if args.beol_power_config:
+        with open(args.beol_power_config, "r") as f:
+            cfg.beol_power_map = json.load(f)
+
+    # Load custom BEOL layer geometry config if provided
     if args.beol_config:
         with open(args.beol_config, "r") as f:
             beol_data = json.load(f)
